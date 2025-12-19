@@ -1,0 +1,23 @@
+pkgname=webmon
+pkgver=0.1.3
+pkgrel=1
+pkgdesc="Lightweight web system monitor"
+arch=("x86_64")
+url="https://example.invalid/webmon"
+license=("custom")
+depends=("glibc")
+makedepends=("gcc" "make")
+source=()
+sha256sums=()
+
+build() {
+  cd "$srcdir"
+  make CC=${CC:-gcc} CFLAGS="$CFLAGS"
+}
+
+package() {
+  cd "$srcdir"
+  install -Dm755 webmon "$pkgdir/usr/bin/webmon"
+  install -Dm644 packaging/systemd/webmon.service "$pkgdir/usr/lib/systemd/system/webmon.service"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/webmon/README.md"
+}

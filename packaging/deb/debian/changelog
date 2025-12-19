@@ -1,0 +1,5 @@
+webmon (0.1.3-1) unstable; urgency=medium
+
+  * Initial package skeleton.
+
+ -- webmon Maintainers <ops@example.com>  Wed, 01 Jan 2025 00:00:00 +0000

@@ -1,0 +1,13 @@
+Source: webmon
+Section: utils
+Priority: optional
+Maintainer: webmon Maintainers <ops@example.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: webmon
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Lightweight web system monitor
+ Minimal web-based system monitor with JSON endpoint and responsive UI.

@@ -1,0 +1,11 @@
+[Unit]
+Description=webmon web system monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/webmon -H 127.0.0.1 -p 61080
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

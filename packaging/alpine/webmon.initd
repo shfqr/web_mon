@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+
+command="/usr/bin/webmon"
+command_args="${WBOPTS:--H 127.0.0.1 -p 61080}"
+pidfile="/run/webmon.pid"
+command_background="yes"
+name="webmon"
+
+depend() {
+    need net
+}
+
+start_pre() {
+    checkpath --directory /run
+}
