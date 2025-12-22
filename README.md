@@ -15,6 +15,7 @@ CLI flags:
 - `-d <path>`: filesystem to report (default `/`).
 - `-n <iface1,iface2>`: comma-separated interfaces to include; defaults to all non-loopback.
 - `-H`, `-p`, `-r`: host (default `127.0.0.1`), port (default `61080`), and browser refresh interval (default `2.0` seconds).
+- `-w <count>`: HTTP worker threads (default `2`, max `8`).
 
 Displayed fields (auto-updated in-page with inline bars, no full refresh):
 - Uptime and connected user count.

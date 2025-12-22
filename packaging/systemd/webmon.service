@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/webmon -H 127.0.0.1 -p 61080
+ExecStart=/usr/bin/webmon -H 127.0.0.1 -p 61080 -w 2
 Restart=on-failure
 
 [Install]

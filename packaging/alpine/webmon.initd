@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 
 command="/usr/bin/webmon"
-command_args="${WBOPTS:--H 127.0.0.1 -p 61080}"
+command_args="${WBOPTS:--H 127.0.0.1 -p 61080 -w 2}"
 pidfile="/run/webmon.pid"
 command_background="yes"
 name="webmon"

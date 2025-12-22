@@ -97,6 +97,18 @@ struct SharedState {
     pthread_mutex_t lock;
 };
 
+static void handle_http_client(int client_fd, struct SharedState *state, double refresh);
+
+struct ClientQueue {
+    int fds[64];
+    int head;
+    int tail;
+    int count;
+    int stop;
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+};
+
 static volatile sig_atomic_t g_stop = 0;
 
 static void on_signal(int sig) {
@@ -739,6 +751,60 @@ struct SamplerArgs {
     struct SharedState *state;
 };
 
+struct WorkerArgs {
+    struct ClientQueue *queue;
+    struct SharedState *state;
+    double refresh;
+};
+
+static void queue_init(struct ClientQueue *q) {
+    memset(q, 0, sizeof(*q));
+    pthread_mutex_init(&q->lock, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+}
+
+static void queue_destroy(struct ClientQueue *q) {
+    pthread_mutex_destroy(&q->lock);
+    pthread_cond_destroy(&q->not_empty);
+}
+
+static int queue_push(struct ClientQueue *q, int fd) {
+    pthread_mutex_lock(&q->lock);
+    if (q->count >= (int)(sizeof(q->fds) / sizeof(q->fds[0]))) {
+        pthread_mutex_unlock(&q->lock);
+        return -1;
+    }
+    q->fds[q->tail] = fd;
+    q->tail = (q->tail + 1) % (int)(sizeof(q->fds) / sizeof(q->fds[0]));
+    q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+    return 0;
+}
+
+static int queue_pop(struct ClientQueue *q, int *fd) {
+    pthread_mutex_lock(&q->lock);
+    while (q->count == 0 && !q->stop) {
+        pthread_cond_wait(&q->not_empty, &q->lock);
+    }
+    if (q->count == 0 && q->stop) {
+        pthread_mutex_unlock(&q->lock);
+        return -1;
+    }
+    *fd = q->fds[q->head];
+    q->head = (q->head + 1) % (int)(sizeof(q->fds) / sizeof(q->fds[0]));
+    q->count--;
+    pthread_mutex_unlock(&q->lock);
+    return 0;
+}
+
+static void queue_stop(struct ClientQueue *q) {
+    pthread_mutex_lock(&q->lock);
+    q->stop = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+}
+
 static void *sampler_thread(void *arg) {
     struct SamplerArgs *cfg = (struct SamplerArgs *)arg;
     while (!g_stop) {
@@ -748,6 +814,21 @@ static void *sampler_thread(void *arg) {
             cfg->state->stats = s;
             cfg->state->has_stats = 1;
             pthread_mutex_unlock(&cfg->state->lock);
+        }
+    }
+    return NULL;
+}
+
+static void *worker_thread(void *arg) {
+    struct WorkerArgs *cfg = (struct WorkerArgs *)arg;
+    while (!g_stop) {
+        int client_fd = -1;
+        if (queue_pop(cfg->queue, &client_fd) != 0) {
+            break;
+        }
+        if (client_fd >= 0) {
+            handle_http_client(client_fd, cfg->state, cfg->refresh);
+            close(client_fd);
         }
     }
     return NULL;
@@ -1008,7 +1089,7 @@ static void handle_http_client(int client_fd, struct SharedState *state, double 
     }
 }
 
-static int run_http_server(const char *host, int port, double refresh, struct SamplerArgs *sampler_cfg) {
+static int run_http_server(const char *host, int port, double refresh, int workers, struct SamplerArgs *sampler_cfg) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
@@ -1052,7 +1133,39 @@ static int run_http_server(const char *host, int port, double refresh, struct Sa
         return 1;
     }
 
-    printf("Web UI ready at http://%s:%d (refresh %.1fs). Press Ctrl+C to stop.\n", host, port, refresh);
+    struct ClientQueue queue;
+    queue_init(&queue);
+
+    if (workers < 1) workers = 1;
+    if (workers > 8) workers = 8;
+    pthread_t *worker_threads = calloc((size_t)workers, sizeof(*worker_threads));
+    struct WorkerArgs *worker_args = calloc((size_t)workers, sizeof(*worker_args));
+    if (!worker_threads || !worker_args) {
+        fprintf(stderr, "Failed to allocate worker pool.\n");
+        free(worker_threads);
+        free(worker_args);
+        queue_stop(&queue);
+        queue_destroy(&queue);
+        g_stop = 1;
+        pthread_join(thread, NULL);
+        pthread_mutex_destroy(&state.lock);
+        close(server_fd);
+        return 1;
+    }
+    for (int i = 0; i < workers; i++) {
+        worker_args[i].queue = &queue;
+        worker_args[i].state = &state;
+        worker_args[i].refresh = refresh;
+        if (pthread_create(&worker_threads[i], NULL, worker_thread, &worker_args[i]) != 0) {
+            fprintf(stderr, "Failed to start worker %d.\n", i);
+            g_stop = 1;
+            workers = i;
+            break;
+        }
+    }
+
+    printf("Web UI ready at http://%s:%d (refresh %.1fs, workers %d). Press Ctrl+C to stop.\n",
+           host, port, refresh, workers);
     while (!g_stop) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -1063,12 +1176,22 @@ static int run_http_server(const char *host, int port, double refresh, struct Sa
 
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) continue;
-        handle_http_client(client_fd, &state, refresh);
-        close(client_fd);
+        if (queue_push(&queue, client_fd) != 0) {
+            const char *resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\nServer busy.\n";
+            write_all(client_fd, resp, strlen(resp));
+            close(client_fd);
+        }
     }
 
+    queue_stop(&queue);
+    for (int i = 0; i < workers; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
     pthread_join(thread, NULL);
     pthread_mutex_destroy(&state.lock);
+    queue_destroy(&queue);
+    free(worker_threads);
+    free(worker_args);
     close(server_fd);
     return 0;
 }
@@ -1082,6 +1205,7 @@ static void usage(const char *prog) {
             "  -p <port>      Port for web mode (default 61080)\n"
             "  -r <seconds>   Browser refresh interval for web UI (default 2.0)\n"
             "  -n <list>      Comma-separated interfaces to include (default: all non-loopback)\n"
+            "  -w <count>     HTTP worker threads (default 2, max 8)\n"
             "  -h             Show this help\n",
             prog);
 }
@@ -1096,9 +1220,10 @@ int main(int argc, char **argv) {
     int port = 61080;
     double refresh = 2.0;
     const char *iface_arg = NULL;
+    int workers = 2;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:d:H:p:r:n:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:d:H:p:r:n:w:h")) != -1) {
         switch (opt) {
             case 'i':
                 interval = atof(optarg);
@@ -1119,6 +1244,9 @@ int main(int argc, char **argv) {
             case 'n':
                 iface_arg = optarg;
                 break;
+            case 'w':
+                workers = atoi(optarg);
+                break;
             case 'h':
             default:
                 usage(argv[0]);
@@ -1135,7 +1263,7 @@ int main(int argc, char **argv) {
         .filter_count = iface_count,
         .state = NULL,
     };
-    int rc = run_http_server(host, port, refresh, &cfg);
+    int rc = run_http_server(host, port, refresh, workers, &cfg);
     free_interfaces(ifaces, iface_count);
     return rc;
 }
