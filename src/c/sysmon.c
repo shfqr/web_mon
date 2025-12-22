@@ -958,8 +958,12 @@ static void render_html(const struct Stats *s, double refresh, char *buf, size_t
                 "</table><p id='net-empty' style='display:none'>No network traffic detected.</p>");
     }
 
-    char json_body[65536];
-    render_json(s, json_body, sizeof json_body);
+    char *json_body = malloc(65536);
+    const char *json_payload = "{}";
+    if (json_body) {
+        render_json(s, json_body, 65536);
+        json_payload = json_body;
+    }
 
     size_t off = 0;
     appendf(buf, bufsize, &off, "<!doctype html><html><head>");
@@ -1029,7 +1033,7 @@ static void render_html(const struct Stats *s, double refresh, char *buf, size_t
 
     appendf(buf, bufsize, &off, "<script>(function(){\n");
     appendf(buf, bufsize, &off, "const refreshMs=Math.max(250,%.0f);\n", refresh * 1000.0);
-    appendf(buf, bufsize, &off, "let data=%s;\n", json_body);
+    appendf(buf, bufsize, &off, "let data=%s;\n", json_payload);
     appendf(buf, bufsize, &off, "const netWindow=300000;let netHist=[];\n");
     appendf(buf, bufsize, &off, "const metricsUrl=(function(){const path=window.location.pathname;const lastSlash=path.lastIndexOf('/');const seg=path.substring(lastSlash+1);let dir;if(path.endsWith('/')){dir=path;}else if(seg && seg.indexOf('.')>=0){dir=path.substring(0,lastSlash+1)||'/';}else{dir=path+'/';}return window.location.origin + dir + 'metrics';})();\n");
     appendf(buf, bufsize, &off, "const prefersDark=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);\n");
@@ -1047,6 +1051,7 @@ static void render_html(const struct Stats *s, double refresh, char *buf, size_t
     appendf(buf, bufsize, &off, "async function tick(){try{const res=await fetch(metricsUrl,{cache:'no-store'});if(res.ok){data=await res.json();}else{console.error('poll status',res.status);}}catch(e){console.error('poll failed',e);}render(data);setTimeout(tick,refreshMs);}\n");
     appendf(buf, bufsize, &off, "bindTheme();render(data);tick();\n");
     appendf(buf, bufsize, &off, "})();</script></body></html>");
+    free(json_body);
 }
 
 static void handle_http_client(int client_fd, struct SharedState *state, double refresh) {
@@ -1069,23 +1074,37 @@ static void handle_http_client(int client_fd, struct SharedState *state, double 
     }
 
     if (is_metrics_path(path)) {
-        char body[65536];
-        render_json(&snapshot, body, sizeof body);
+        size_t body_size = 65536;
+        char *body = malloc(body_size);
+        if (!body) {
+            const char *resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nOut of memory.\n";
+            write_all(client_fd, resp, strlen(resp));
+            return;
+        }
+        render_json(&snapshot, body, body_size);
         char header[128];
         snprintf(header, sizeof header,
                  "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n",
                  strlen(body));
         write_all(client_fd, header, strlen(header));
         write_all(client_fd, body, strlen(body));
+        free(body);
     } else {
-        char body[131072];
-        render_html(&snapshot, refresh, body, sizeof body);
+        size_t body_size = 131072;
+        char *body = malloc(body_size);
+        if (!body) {
+            const char *resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nOut of memory.\n";
+            write_all(client_fd, resp, strlen(resp));
+            return;
+        }
+        render_html(&snapshot, refresh, body, body_size);
         char header[128];
         snprintf(header, sizeof header,
                  "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\n\r\n",
                  strlen(body));
         write_all(client_fd, header, strlen(header));
         write_all(client_fd, body, strlen(body));
+        free(body);
     }
 }
 
