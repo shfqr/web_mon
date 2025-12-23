@@ -1184,12 +1184,14 @@ static void render_html(const struct Stats *s, double refresh, char *buf, size_t
     appendf(buf, bufsize, &off, "const netWindow=300000;let netHist=[];\n");
     appendf(buf, bufsize, &off, "const metricsUrl=(function(){const path=window.location.pathname;const lastSlash=path.lastIndexOf('/');const seg=path.substring(lastSlash+1);let dir;if(path.endsWith('/')){dir=path;}else if(seg && seg.indexOf('.')>=0){dir=path.substring(0,lastSlash+1)||'/';}else{dir=path+'/';}return window.location.origin + dir + 'metrics';})();\n");
     if (token && token[0] != '\0') {
-        appendf(buf, bufsize, &off, "const authToken=");
+        appendf(buf, bufsize, &off, "let authToken=");
         append_json_string(buf, bufsize, &off, token);
         appendf(buf, bufsize, &off, ";\n");
     } else {
-        appendf(buf, bufsize, &off, "const authToken=null;\n");
+        appendf(buf, bufsize, &off, "let authToken=null;\n");
     }
+    appendf(buf, bufsize, &off, "const pageToken=(function(){try{const p=new URLSearchParams(window.location.search);const t=p.get('token');return (t&&t.length)?t:null;}catch(e){return null;}})();\n");
+    appendf(buf, bufsize, &off, "if(!authToken && pageToken){authToken=pageToken;}\n");
     appendf(buf, bufsize, &off, "const prefersDark=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);\n");
     appendf(buf, bufsize, &off, "let theme=localStorage.getItem('theme')||(prefersDark?'dark':'light');\n");
     appendf(buf, bufsize, &off, "function applyTheme(t){document.documentElement.setAttribute('data-theme',t);localStorage.setItem('theme',t);}\n");
