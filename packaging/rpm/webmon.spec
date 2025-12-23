@@ -21,6 +21,7 @@ make CC=%{__cc} CFLAGS="$RPM_OPT_FLAGS"
 rm -rf %{buildroot}
 make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 install -Dm0644 packaging/systemd/webmon.service %{buildroot}%{_unitdir}/webmon.service
+install -Dm0644 config/webmon.conf.example %{buildroot}%{_sysconfdir}/webmon.conf
 
 %check
 %{buildroot}%{_bindir}/webmon -h >/dev/null 2>&1 || true
@@ -29,6 +30,7 @@ install -Dm0644 packaging/systemd/webmon.service %{buildroot}%{_unitdir}/webmon.
 %doc README.md
 %{_bindir}/webmon
 %{_unitdir}/webmon.service
+%config(noreplace) %{_sysconfdir}/webmon.conf
 
 %changelog
 * Wed Jan 01 2025 webmon Maintainers <ops@example.com> - 0.1.3-1

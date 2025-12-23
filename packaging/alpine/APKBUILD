@@ -22,6 +22,7 @@ build() {
 package() {
   cd "$builddir"
   install -Dm755 webmon "$pkgdir/usr/bin/webmon"
+  install -Dm644 config/webmon.conf.example "$pkgdir/etc/webmon.conf"
   install -Dm755 packaging/alpine/webmon.initd "$pkgdir/etc/init.d/webmon"
   install -Dm644 README.md "$pkgdir/usr/share/doc/webmon/README.md"
 }

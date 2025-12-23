@@ -16,10 +16,11 @@ CLI flags:
 - `-n <iface1,iface2>`: comma-separated interfaces to include; defaults to all non-loopback.
 - `-H`, `-p`, `-r`: host (default `127.0.0.1`), port (default `61080`), and browser refresh interval (default `2.0` seconds).
 - `-w <count>`: HTTP worker threads (default `2`, max `8`).
-- `-t <token>`: shared token for HTTP auth (optional).
+- `-t <token>`: shared token for HTTP auth (optional, or read from `/etc/webmon.conf`).
 
 Auth notes:
-- Start with `-t <token>` and open `http://<host>:61080/?token=<token>` in a browser.
+- Set `token=...` in `/etc/webmon.conf` (or use `-t <token>`).
+- Open `http://<host>:61080/?token=<token>` in a browser if a token is set.
 - `/metrics` accepts `X-WebMon-Token: <token>` or the `?token=` query.
 
 Displayed fields (auto-updated in-page with inline bars, no full refresh):

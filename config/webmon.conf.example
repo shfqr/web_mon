@@ -1,0 +1,3 @@
+# WebMon configuration
+# Uncomment and set to enable HTTP auth for the UI and /metrics.
+# token=REPLACE_WITH_RANDOM_TOKEN

@@ -28,6 +28,7 @@
 #define MAX_CORES 128
 #define PROC_NAME_LEN 64
 #define CLIENT_TIMEOUT_SEC 5
+#define TOKEN_CONFIG_PATH "/etc/webmon.conf"
 
 struct CpuSample {
     unsigned long long total;
@@ -127,6 +128,41 @@ static void msleep(double seconds) {
     ts.tv_sec = (time_t)seconds;
     ts.tv_nsec = (long)((seconds - ts.tv_sec) * 1e9);
     nanosleep(&ts, NULL);
+}
+
+static int read_token_file(const char *path, char *out, size_t out_size) {
+    if (!path || !out || out_size == 0) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '\0' || *p == '\n' || *p == '#' || *p == ';') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        char *key_end = eq;
+        while (key_end > p && isspace((unsigned char)key_end[-1])) key_end--;
+        size_t key_len = (size_t)(key_end - p);
+        if (key_len != 5 || strncasecmp(p, "token", 5) != 0) continue;
+        char *val = eq + 1;
+        while (*val && isspace((unsigned char)*val)) val++;
+        char *val_end = val + strcspn(val, "\r\n");
+        while (val_end > val && isspace((unsigned char)val_end[-1])) val_end--;
+        if (val_end > val && (*val == '\'' || *val == '"') && val_end[-1] == *val) {
+            val++;
+            val_end--;
+        }
+        if (val_end <= val) continue;
+        size_t val_len = (size_t)(val_end - val);
+        if (val_len >= out_size) val_len = out_size - 1;
+        memcpy(out, val, val_len);
+        out[val_len] = '\0';
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return -1;
 }
 
 static int parse_cpu_line(const char *line, struct CpuSample *out) {
@@ -1359,7 +1395,8 @@ static void usage(const char *prog) {
             "  -n <list>      Comma-separated interfaces to include (default: all non-loopback)\n"
             "  -w <count>     HTTP worker threads (default 2, max 8)\n"
             "  -t <token>     Shared token for HTTP auth (optional)\n"
-            "  -h             Show this help\n",
+            "  -h             Show this help\n"
+            "  Config: " TOKEN_CONFIG_PATH " (token=...)\n",
             prog);
 }
 
@@ -1376,6 +1413,7 @@ int main(int argc, char **argv) {
     const char *iface_arg = NULL;
     int workers = 2;
     const char *token = NULL;
+    char token_buf[256] = {0};
 
     int opt;
     while ((opt = getopt(argc, argv, "i:d:H:p:r:n:w:t:h")) != -1) {
@@ -1403,7 +1441,8 @@ int main(int argc, char **argv) {
                 workers = atoi(optarg);
                 break;
             case 't':
-                token = optarg;
+                snprintf(token_buf, sizeof token_buf, "%s", optarg);
+                token = token_buf;
                 break;
             case 'h':
             default:
@@ -1421,6 +1460,13 @@ int main(int argc, char **argv) {
         .filter_count = iface_count,
         .state = NULL,
     };
+    if (!token || token[0] == '\0') {
+        if (read_token_file(TOKEN_CONFIG_PATH, token_buf, sizeof token_buf) == 0) {
+            token = token_buf;
+        } else {
+            token = NULL;
+        }
+    }
     int rc = run_http_server(host, port, refresh, workers, token, &cfg);
     free_interfaces(ifaces, iface_count);
     return rc;
