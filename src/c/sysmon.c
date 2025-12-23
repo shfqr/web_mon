@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,6 +12,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/statvfs.h>
@@ -25,6 +27,7 @@
 #define MAX_PROCS 64
 #define MAX_CORES 128
 #define PROC_NAME_LEN 64
+#define CLIENT_TIMEOUT_SEC 5
 
 struct CpuSample {
     unsigned long long total;
@@ -97,7 +100,7 @@ struct SharedState {
     pthread_mutex_t lock;
 };
 
-static void handle_http_client(int client_fd, struct SharedState *state, double refresh);
+static void handle_http_client(int client_fd, struct SharedState *state, double refresh, const char *token);
 
 struct ClientQueue {
     int fds[64];
@@ -755,6 +758,7 @@ struct WorkerArgs {
     struct ClientQueue *queue;
     struct SharedState *state;
     double refresh;
+    const char *token;
 };
 
 static void queue_init(struct ClientQueue *q) {
@@ -805,6 +809,109 @@ static void queue_stop(struct ClientQueue *q) {
     pthread_mutex_unlock(&q->lock);
 }
 
+static void set_client_timeouts(int fd) {
+    struct timeval tv;
+    tv.tv_sec = CLIENT_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
+static ssize_t recv_request(int fd, char *buf, size_t bufsize) {
+    if (bufsize == 0) return -1;
+    size_t off = 0;
+    buf[0] = '\0';
+    while (off < bufsize - 1) {
+        ssize_t n = recv(fd, buf + off, bufsize - 1 - off, 0);
+        if (n <= 0) return n;
+        off += (size_t)n;
+        buf[off] = '\0';
+        if (strstr(buf, "\r\n\r\n")) break;
+    }
+    return (ssize_t)off;
+}
+
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static size_t url_decode(const char *src, size_t len, char *dst, size_t dst_size) {
+    size_t di = 0;
+    for (size_t si = 0; si < len && di + 1 < dst_size; si++) {
+        if (src[si] == '%' && si + 2 < len) {
+            int hi = hex_value(src[si + 1]);
+            int lo = hex_value(src[si + 2]);
+            if (hi >= 0 && lo >= 0) {
+                dst[di++] = (char)((hi << 4) | lo);
+                si += 2;
+                continue;
+            }
+        }
+        dst[di++] = src[si];
+    }
+    dst[di] = '\0';
+    return di;
+}
+
+static int token_matches_query(const char *path, const char *token) {
+    const char *q = strchr(path, '?');
+    if (!q) return 0;
+    q++;
+    while (*q) {
+        const char *key = q;
+        const char *amp = strchr(q, '&');
+        if (!amp) amp = q + strlen(q);
+        const char *eq = memchr(key, '=', (size_t)(amp - key));
+        if (eq) {
+            size_t key_len = (size_t)(eq - key);
+            if (key_len == 5 && strncmp(key, "token", 5) == 0) {
+                char value[256];
+                size_t val_len = (size_t)(amp - eq - 1);
+                url_decode(eq + 1, val_len, value, sizeof value);
+                if (strcmp(value, token) == 0) return 1;
+            }
+        }
+        q = (*amp == '&') ? amp + 1 : amp;
+    }
+    return 0;
+}
+
+static int token_matches_header(const char *req, const char *token) {
+    const char *p = strstr(req, "\r\n");
+    if (!p) return 0;
+    p += 2;
+    while (*p && !(p[0] == '\r' && p[1] == '\n')) {
+        const char *line_end = strstr(p, "\r\n");
+        if (!line_end) line_end = p + strlen(p);
+        const char *colon = memchr(p, ':', (size_t)(line_end - p));
+        if (colon) {
+            size_t name_len = (size_t)(colon - p);
+            if (name_len == 13 && strncasecmp(p, "X-WebMon-Token", name_len) == 0) {
+                const char *val = colon + 1;
+                while (val < line_end && (*val == ' ' || *val == '\t')) val++;
+                size_t val_len = (size_t)(line_end - val);
+                while (val_len > 0 && (val[val_len - 1] == ' ' || val[val_len - 1] == '\t')) {
+                    val_len--;
+                }
+                if (strlen(token) == val_len && strncmp(val, token, val_len) == 0) return 1;
+            }
+        }
+        if (*line_end == '\0') break;
+        p = line_end + 2;
+    }
+    return 0;
+}
+
+static int is_authorized(const char *req, const char *path, const char *token) {
+    if (!token || token[0] == '\0') return 1;
+    if (token_matches_header(req, token)) return 1;
+    if (token_matches_query(path, token)) return 1;
+    return 0;
+}
+
 static void *sampler_thread(void *arg) {
     struct SamplerArgs *cfg = (struct SamplerArgs *)arg;
     while (!g_stop) {
@@ -827,7 +934,7 @@ static void *worker_thread(void *arg) {
             break;
         }
         if (client_fd >= 0) {
-            handle_http_client(client_fd, cfg->state, cfg->refresh);
+            handle_http_client(client_fd, cfg->state, cfg->refresh, cfg->token);
             close(client_fd);
         }
     }
@@ -836,8 +943,12 @@ static void *worker_thread(void *arg) {
 
 static void write_all(int fd, const char *buf, size_t len) {
     size_t written = 0;
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags = MSG_NOSIGNAL;
+#endif
     while (written < len) {
-        ssize_t n = send(fd, buf + written, len - written, 0);
+        ssize_t n = send(fd, buf + written, len - written, flags);
         if (n <= 0) return;
         written += (size_t)n;
     }
@@ -915,7 +1026,7 @@ static void render_json(const struct Stats *s, char *buf, size_t bufsize) {
     appendf(buf, bufsize, &off, " }");
 }
 
-static void render_html(const struct Stats *s, double refresh, char *buf, size_t bufsize) {
+static void render_html(const struct Stats *s, double refresh, char *buf, size_t bufsize, const char *token) {
     char mem_used[32], mem_total[32], swap_used[32], swap_total[32], disk_used[32], disk_total[32];
     format_bytes(s->mem.total - s->mem.available, mem_used, sizeof mem_used);
     format_bytes(s->mem.total, mem_total, sizeof mem_total);
@@ -1036,6 +1147,13 @@ static void render_html(const struct Stats *s, double refresh, char *buf, size_t
     appendf(buf, bufsize, &off, "let data=%s;\n", json_payload);
     appendf(buf, bufsize, &off, "const netWindow=300000;let netHist=[];\n");
     appendf(buf, bufsize, &off, "const metricsUrl=(function(){const path=window.location.pathname;const lastSlash=path.lastIndexOf('/');const seg=path.substring(lastSlash+1);let dir;if(path.endsWith('/')){dir=path;}else if(seg && seg.indexOf('.')>=0){dir=path.substring(0,lastSlash+1)||'/';}else{dir=path+'/';}return window.location.origin + dir + 'metrics';})();\n");
+    if (token && token[0] != '\0') {
+        appendf(buf, bufsize, &off, "const authToken=");
+        append_json_string(buf, bufsize, &off, token);
+        appendf(buf, bufsize, &off, ";\n");
+    } else {
+        appendf(buf, bufsize, &off, "const authToken=null;\n");
+    }
     appendf(buf, bufsize, &off, "const prefersDark=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);\n");
     appendf(buf, bufsize, &off, "let theme=localStorage.getItem('theme')||(prefersDark?'dark':'light');\n");
     appendf(buf, bufsize, &off, "function applyTheme(t){document.documentElement.setAttribute('data-theme',t);localStorage.setItem('theme',t);}\n");
@@ -1048,19 +1166,32 @@ static void render_html(const struct Stats *s, double refresh, char *buf, size_t
     appendf(buf, bufsize, &off, "function renderNetGraph(){const el=document.getElementById('net-graph');if(!el)return;if(netHist.length<2){el.innerHTML='<p class=\"muted\">Collecting network data...</p>';return;}const max=Math.max.apply(null,netHist.map(function(p){return Math.max(p.rx,p.tx,1);}));const w=300,h=80;function toPts(arr){return arr.map(function(v,i){const x=(i/(arr.length-1))*w;const y=h-(v/max*h);return x.toFixed(1)+','+y.toFixed(1);}).join(' ');}const rxPts=toPts(netHist.map(function(p){return p.rx;}));const txPts=toPts(netHist.map(function(p){return p.tx;}));el.innerHTML='<svg viewBox=\"0 0 '+w+' '+h+'\" preserveAspectRatio=\"none\"><polyline fill=\"none\" stroke=\"var(--accent-rx)\" stroke-width=\"1.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\" points=\"'+rxPts+'\"/><polyline fill=\"none\" stroke=\"var(--accent-tx)\" stroke-width=\"1.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\" points=\"'+txPts+'\"/></svg>';}\n");
     appendf(buf, bufsize, &off, "function render(d){if(!d)return;const up=document.getElementById('uptime-pill');if(up){up.textContent='⏱ '+fmtUptime(d.uptime_seconds);}const usr=document.getElementById('users-pill');if(usr){usr.textContent='👥 '+(d.user_count||0);}const cpu=document.getElementById('cpu');if(cpu){cpu.innerHTML='CPU: <span class=\"metric\">'+d.cpu_percent.toFixed(1)+'%%</span> | Load: '+d.loadavg.map(function(x){return x.toFixed(2);}).join(' / ');const b=cpu.nextElementSibling;if(b){b.innerHTML=bar(d.cpu_percent,'cpu');}}const coresWrap=document.getElementById('cores');if(coresWrap){const cores=d.cores||[];if(cores.length===0){coresWrap.innerHTML='<p id=\"cores-empty\">Per-core data unavailable.</p>'; }else{const rows=cores.map(function(v,i){return '<div class=\"core-row\"><span class=\"core-name\">CPU'+i+'</span><div class=\"core-bar\"><div class=\"fill cpu\" style=\"width:'+clamp(v).toFixed(1)+'%%\"></div></div><span class=\"core-pct\">'+v.toFixed(1)+'%%</span></div>';}).join('');coresWrap.innerHTML=rows;}}const usedMem=d.memory.total-d.memory.available;const mem=document.getElementById('mem');if(mem){const pct=d.memory.total?(usedMem/d.memory.total*100):0;mem.innerHTML='Mem: <span class=\"metric\">'+fmtBytes(usedMem)+'</span> / '+fmtBytes(d.memory.total);const b=mem.nextElementSibling;if(b){b.innerHTML=bar(pct,'mem');}}const sw=document.getElementById('swap');if(sw){const used=d.memory.swap_total-d.memory.swap_free;const pct=d.memory.swap_total?(used/d.memory.swap_total*100):0;sw.innerHTML='Swap: <span class=\"metric\">'+fmtBytes(used)+'</span> / '+fmtBytes(d.memory.swap_total);const b=sw.nextElementSibling;if(b){b.innerHTML=bar(pct,'swap');}}const disk=document.getElementById('disk');if(disk){const pct=d.disk.total?(d.disk.used/d.disk.total*100):0;disk.innerHTML='Disk ('+esc(d.disk.path)+'): <span class=\"metric\">'+fmtBytes(d.disk.used)+'</span> / '+fmtBytes(d.disk.total);const b=disk.nextElementSibling;if(b){b.innerHTML=bar(pct,'disk');}}const netWrap=document.getElementById('net');if(netWrap){const keys=Object.keys(d.net||{});if(keys.length===0){netWrap.innerHTML='<p id=\"net-empty\">No network traffic detected.</p>'; }else{let max=1;keys.forEach(function(k){const r=d.net[k];max=Math.max(max,r.rx_rate,r.tx_rate);});const rows=keys.sort().map(function(k){const r=d.net[k];const rxPct=r.rx_rate/max*100;const txPct=r.tx_rate/max*100;return '<tr><td>'+esc(k)+'</td><td>'+fmtBytes(r.rx_rate)+'/s'+bar(rxPct,'net-rx')+'</td><td>'+fmtBytes(r.tx_rate)+'/s'+bar(txPct,'net-tx')+'</td></tr>';}).join('');netWrap.innerHTML='<table id=\"net-table\"><tr><th>Interface</th><th>RX</th><th>TX</th></tr>'+rows+'</table>';}}updateNetHistory(d);renderNetGraph();const sys=document.getElementById('sys');if(sys){let rows=[];if(d.hostname){rows.push('<div>🏷️ '+esc(d.hostname)+'</div>');}if(typeof d.temp_c==='number'){rows.push('<div>🌡️ '+d.temp_c.toFixed(1)+'°C</div>');}if(typeof d.entropy==='number'){rows.push('<div>🎲 Entropy '+d.entropy+'</div>');}if(d.files&&typeof d.files.used==='number'&&typeof d.files.max==='number'&&d.files.max>0){const pct=d.files.used/d.files.max*100;rows.push('<div>📂 FDs '+d.files.used+'/'+d.files.max+' ('+pct.toFixed(1)+'%%)</div>');}if(rows.length===0){rows.push('<div class=\"muted\">No extra system data.</div>');}sys.innerHTML=rows.join('');}const procWrap=document.getElementById('procs');if(procWrap){const procs=d.procs||[];if(procs.length===0){procWrap.innerHTML='<p id=\"procs-empty\">No processes above 1%% CPU.</p>'; }else{const rows=procs.map(function(p){return '<tr><td>'+esc(p.name)+'</td><td>'+p.pid+'</td><td>'+p.percent.toFixed(1)+'%%</td></tr>';}).join('');procWrap.innerHTML='<table id=\"procs-table\"><tr><th>Name</th><th>PID</th><th>CPU</th></tr>'+rows+'</table>';}}const ts=document.getElementById('last-ts');if(ts){ts.textContent=new Date().toLocaleTimeString();}}\n");
     appendf(buf, bufsize, &off, "function bindTheme(){applyTheme(theme);}\n");
-    appendf(buf, bufsize, &off, "async function tick(){try{const res=await fetch(metricsUrl,{cache:'no-store'});if(res.ok){data=await res.json();}else{console.error('poll status',res.status);}}catch(e){console.error('poll failed',e);}render(data);setTimeout(tick,refreshMs);}\n");
+    appendf(buf, bufsize, &off, "async function tick(){try{const opts={cache:'no-store'};if(authToken){opts.headers={'X-WebMon-Token':authToken};}const res=await fetch(metricsUrl,opts);if(res.ok){data=await res.json();}else{console.error('poll status',res.status);}}catch(e){console.error('poll failed',e);}render(data);setTimeout(tick,refreshMs);}\n");
     appendf(buf, bufsize, &off, "bindTheme();render(data);tick();\n");
     appendf(buf, bufsize, &off, "})();</script></body></html>");
     free(json_body);
 }
 
-static void handle_http_client(int client_fd, struct SharedState *state, double refresh) {
-    char req[512];
-    ssize_t n = recv(client_fd, req, sizeof req - 1, 0);
+static void handle_http_client(int client_fd, struct SharedState *state, double refresh, const char *token) {
+    char req[2048];
+    ssize_t n = recv_request(client_fd, req, sizeof req);
     if (n <= 0) return;
-    req[n] = '\0';
-    char method[8] = {0}, path[64] = {0};
-    sscanf(req, "%7s %63s", method, path);
+    char method[8] = {0}, path[256] = {0};
+    if (sscanf(req, "%7s %255s", method, path) != 2) {
+        const char *resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nMalformed request.\n";
+        write_all(client_fd, resp, strlen(resp));
+        return;
+    }
+    if (strcmp(method, "GET") != 0) {
+        const char *resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\n\r\nMethod not allowed.\n";
+        write_all(client_fd, resp, strlen(resp));
+        return;
+    }
+    if (!is_authorized(req, path, token)) {
+        const char *resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n\r\nUnauthorized.\n";
+        write_all(client_fd, resp, strlen(resp));
+        return;
+    }
 
     pthread_mutex_lock(&state->lock);
     int ready = state->has_stats;
@@ -1097,7 +1228,7 @@ static void handle_http_client(int client_fd, struct SharedState *state, double 
             write_all(client_fd, resp, strlen(resp));
             return;
         }
-        render_html(&snapshot, refresh, body, body_size);
+        render_html(&snapshot, refresh, body, body_size, token);
         char header[128];
         snprintf(header, sizeof header,
                  "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\n\r\n",
@@ -1108,7 +1239,7 @@ static void handle_http_client(int client_fd, struct SharedState *state, double 
     }
 }
 
-static int run_http_server(const char *host, int port, double refresh, int workers, struct SamplerArgs *sampler_cfg) {
+static int run_http_server(const char *host, int port, double refresh, int workers, const char *token, struct SamplerArgs *sampler_cfg) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
@@ -1175,6 +1306,7 @@ static int run_http_server(const char *host, int port, double refresh, int worke
         worker_args[i].queue = &queue;
         worker_args[i].state = &state;
         worker_args[i].refresh = refresh;
+        worker_args[i].token = token;
         if (pthread_create(&worker_threads[i], NULL, worker_thread, &worker_args[i]) != 0) {
             fprintf(stderr, "Failed to start worker %d.\n", i);
             g_stop = 1;
@@ -1195,6 +1327,7 @@ static int run_http_server(const char *host, int port, double refresh, int worke
 
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) continue;
+        set_client_timeouts(client_fd);
         if (queue_push(&queue, client_fd) != 0) {
             const char *resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\nServer busy.\n";
             write_all(client_fd, resp, strlen(resp));
@@ -1225,6 +1358,7 @@ static void usage(const char *prog) {
             "  -r <seconds>   Browser refresh interval for web UI (default 2.0)\n"
             "  -n <list>      Comma-separated interfaces to include (default: all non-loopback)\n"
             "  -w <count>     HTTP worker threads (default 2, max 8)\n"
+            "  -t <token>     Shared token for HTTP auth (optional)\n"
             "  -h             Show this help\n",
             prog);
 }
@@ -1232,6 +1366,7 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGPIPE, SIG_IGN);
 
     double interval = 1.0;
     const char *disk_path = "/";
@@ -1240,9 +1375,10 @@ int main(int argc, char **argv) {
     double refresh = 2.0;
     const char *iface_arg = NULL;
     int workers = 2;
+    const char *token = NULL;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:d:H:p:r:n:w:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:d:H:p:r:n:w:t:h")) != -1) {
         switch (opt) {
             case 'i':
                 interval = atof(optarg);
@@ -1266,6 +1402,9 @@ int main(int argc, char **argv) {
             case 'w':
                 workers = atoi(optarg);
                 break;
+            case 't':
+                token = optarg;
+                break;
             case 'h':
             default:
                 usage(argv[0]);
@@ -1282,7 +1421,7 @@ int main(int argc, char **argv) {
         .filter_count = iface_count,
         .state = NULL,
     };
-    int rc = run_http_server(host, port, refresh, workers, &cfg);
+    int rc = run_http_server(host, port, refresh, workers, token, &cfg);
     free_interfaces(ifaces, iface_count);
     return rc;
 }
