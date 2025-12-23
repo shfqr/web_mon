@@ -4,7 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/webmon -H 127.0.0.1 -p 61080 -w 2
+Environment="WEBMON_OPTS=-H 127.0.0.1 -p 61080 -w 2"
+EnvironmentFile=-/etc/default/webmon
+EnvironmentFile=-/etc/sysconfig/webmon
+ExecStart=/usr/bin/webmon $WEBMON_OPTS
 Restart=on-failure
 
 [Install]
