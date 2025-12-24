@@ -22,6 +22,7 @@ Auth notes:
 - Set `token=...` in `/etc/webmon.conf` (or use `-t <token>`).
 - Open `http://<host>:61080/?token=<token>` in a browser if a token is set.
 - `/metrics` accepts `X-WebMon-Token: <token>` or the `?token=` query.
+- Auth is disabled automatically when running on loopback with `-w 1` (keep-alive mode).
 
 ## Reverse proxy (Caddy)
 Use Caddy as the only public entrypoint so WebMon stays loopback-only and low-load.

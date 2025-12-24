@@ -1413,6 +1413,13 @@ static int run_http_server(const char *host, int port, double refresh, int worke
     if (workers < 1) workers = 1;
     if (workers > 8) workers = 8;
     int allow_keepalive = (workers == 1 && is_loopback);
+    const char *effective_token = token;
+    if (allow_keepalive) {
+        if (token && token[0] != '\0') {
+            fprintf(stderr, "Note: auth disabled for loopback single-worker keep-alive mode.\n");
+        }
+        effective_token = NULL;
+    }
     pthread_t *worker_threads = calloc((size_t)workers, sizeof(*worker_threads));
     struct WorkerArgs *worker_args = calloc((size_t)workers, sizeof(*worker_args));
     if (!worker_threads || !worker_args) {
@@ -1431,7 +1438,7 @@ static int run_http_server(const char *host, int port, double refresh, int worke
         worker_args[i].queue = &queue;
         worker_args[i].state = &state;
         worker_args[i].refresh = refresh;
-        worker_args[i].token = token;
+        worker_args[i].token = effective_token;
         worker_args[i].allow_keepalive = allow_keepalive;
         if (pthread_create(&worker_threads[i], NULL, worker_thread, &worker_args[i]) != 0) {
             fprintf(stderr, "Failed to start worker %d.\n", i);
