@@ -23,6 +23,12 @@ Auth notes:
 - Open `http://<host>:61080/?token=<token>` in a browser if a token is set.
 - `/metrics` accepts `X-WebMon-Token: <token>` or the `?token=` query.
 
+## Reverse proxy (Caddy)
+Use Caddy as the only public entrypoint so WebMon stays loopback-only and low-load.
+- Terminate TLS and handle public access control at the proxy.
+- Keep WebMon on `127.0.0.1` and run it with `-w 1` so Caddy can reuse a single upstream connection.
+- Use `config/Caddyfile.example` as a starting point; it strips `/webmon` and limits upstream connections.
+
 Displayed fields (auto-updated in-page with inline bars, no full refresh):
 - Uptime and connected user count.
 - CPU percent plus 1/5/15 minute load averages.
