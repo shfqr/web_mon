@@ -1,0 +1,24 @@
+host1.example.com {
+        @webmon_path {
+                path /webmon /webmon/*
+        }
+        handle @webmon_path {
+                uri strip_prefix /webmon
+                reverse_proxy 127.0.0.1:61080 {
+                        transport http {
+                                versions 1.1
+                                max_conns_per_host 1
+                        }
+                }
+        }
+
+        # Drop / reject all other requests
+        @other_than_valid_paths not path /webmon*
+        respond @other_than_valid_paths 444
+
+        # default headers for any responses that do get through
+        header {
+                -Server
+                -Via
+        }
+}
