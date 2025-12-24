@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <strings.h>
+#include <stdint.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/statvfs.h>
@@ -28,6 +29,7 @@
 #define MAX_CORES 128
 #define PROC_NAME_LEN 64
 #define CLIENT_TIMEOUT_SEC 5
+#define MAX_KEEPALIVE_REQUESTS 256
 #define TOKEN_CONFIG_PATH "/etc/webmon.conf"
 
 struct CpuSample {
@@ -101,7 +103,7 @@ struct SharedState {
     pthread_mutex_t lock;
 };
 
-static void handle_http_client(int client_fd, struct SharedState *state, double refresh, const char *token);
+static void handle_http_client(int client_fd, struct SharedState *state, double refresh, const char *token, int allow_keepalive);
 
 struct ClientQueue {
     int fds[64];
@@ -795,6 +797,7 @@ struct WorkerArgs {
     struct SharedState *state;
     double refresh;
     const char *token;
+    int allow_keepalive;
 };
 
 static void queue_init(struct ClientQueue *q) {
@@ -948,6 +951,48 @@ static int is_authorized(const char *req, const char *path, const char *token) {
     return 0;
 }
 
+static int header_has_token(const char *req, const char *name, const char *token) {
+    const char *p = strstr(req, "\r\n");
+    if (!p) return 0;
+    p += 2;
+    size_t name_len = strlen(name);
+    size_t token_len = strlen(token);
+    while (*p && !(p[0] == '\r' && p[1] == '\n')) {
+        const char *line_end = strstr(p, "\r\n");
+        if (!line_end) line_end = p + strlen(p);
+        const char *colon = memchr(p, ':', (size_t)(line_end - p));
+        if (colon) {
+            size_t hdr_len = (size_t)(colon - p);
+            if (hdr_len == name_len && strncasecmp(p, name, hdr_len) == 0) {
+                const char *val = colon + 1;
+                while (val < line_end) {
+                    while (val < line_end && (isspace((unsigned char)*val) || *val == ',')) val++;
+                    const char *tok = val;
+                    while (val < line_end && *val != ',' && !isspace((unsigned char)*val)) val++;
+                    size_t tok_len = (size_t)(val - tok);
+                    if (tok_len == token_len && strncasecmp(tok, token, tok_len) == 0) {
+                        return 1;
+                    }
+                }
+            }
+        }
+        if (*line_end == '\0') break;
+        p = line_end + 2;
+    }
+    return 0;
+}
+
+static int should_keep_alive(const char *req, const char *version) {
+    if (!version || version[0] == '\0') return 0;
+    if (strcmp(version, "HTTP/1.1") == 0) {
+        return header_has_token(req, "Connection", "close") ? 0 : 1;
+    }
+    if (strcmp(version, "HTTP/1.0") == 0) {
+        return header_has_token(req, "Connection", "keep-alive") ? 1 : 0;
+    }
+    return 0;
+}
+
 static void *sampler_thread(void *arg) {
     struct SamplerArgs *cfg = (struct SamplerArgs *)arg;
     while (!g_stop) {
@@ -970,7 +1015,7 @@ static void *worker_thread(void *arg) {
             break;
         }
         if (client_fd >= 0) {
-            handle_http_client(client_fd, cfg->state, cfg->refresh, cfg->token);
+            handle_http_client(client_fd, cfg->state, cfg->refresh, cfg->token, cfg->allow_keepalive);
             close(client_fd);
         }
     }
@@ -1212,70 +1257,105 @@ static void render_html(const struct Stats *s, double refresh, char *buf, size_t
     free(json_body);
 }
 
-static void handle_http_client(int client_fd, struct SharedState *state, double refresh, const char *token) {
-    char req[2048];
-    ssize_t n = recv_request(client_fd, req, sizeof req);
-    if (n <= 0) return;
-    char method[8] = {0}, path[256] = {0};
-    if (sscanf(req, "%7s %255s", method, path) != 2) {
-        const char *resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nMalformed request.\n";
-        write_all(client_fd, resp, strlen(resp));
-        return;
-    }
-    if (strcmp(method, "GET") != 0) {
-        const char *resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\n\r\nMethod not allowed.\n";
-        write_all(client_fd, resp, strlen(resp));
-        return;
-    }
-    if (!is_authorized(req, path, token)) {
-        const char *resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n\r\nUnauthorized.\n";
-        write_all(client_fd, resp, strlen(resp));
-        return;
-    }
-
-    pthread_mutex_lock(&state->lock);
-    int ready = state->has_stats;
-    struct Stats snapshot = state->stats;
-    pthread_mutex_unlock(&state->lock);
-
-    if (!ready) {
-        const char *resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\nWaiting for first sample...\n";
-        write_all(client_fd, resp, strlen(resp));
-        return;
-    }
-
-    if (is_metrics_path(path)) {
-        size_t body_size = 65536;
-        char *body = malloc(body_size);
-        if (!body) {
-            const char *resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nOut of memory.\n";
+static void handle_http_client(int client_fd, struct SharedState *state, double refresh, const char *token, int allow_keepalive) {
+    int req_count = 0;
+    while (!g_stop) {
+        char req[2048];
+        ssize_t n = recv_request(client_fd, req, sizeof req);
+        if (n <= 0) return;
+        char method[8] = {0}, path[256] = {0}, version[16] = {0};
+        int parsed = sscanf(req, "%7s %255s %15s", method, path, version);
+        if (parsed < 2) {
+            const char *resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nMalformed request.\n";
             write_all(client_fd, resp, strlen(resp));
             return;
         }
-        render_json(&snapshot, body, body_size);
-        char header[128];
-        snprintf(header, sizeof header,
-                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n",
-                 strlen(body));
-        write_all(client_fd, header, strlen(header));
-        write_all(client_fd, body, strlen(body));
-        free(body);
-    } else {
-        size_t body_size = 131072;
-        char *body = malloc(body_size);
-        if (!body) {
-            const char *resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nOut of memory.\n";
+        if (strcmp(method, "GET") != 0) {
+            const char *resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nMethod not allowed.\n";
             write_all(client_fd, resp, strlen(resp));
             return;
         }
-        render_html(&snapshot, refresh, body, body_size, token);
-        char header[128];
-        snprintf(header, sizeof header,
-                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\n\r\n",
-                 strlen(body));
-        write_all(client_fd, header, strlen(header));
-        write_all(client_fd, body, strlen(body));
-        free(body);
+        const char *http_ver = (parsed >= 3) ? version : "HTTP/1.0";
+        int keep = allow_keepalive && should_keep_alive(req, http_ver);
+        const char *conn_hdr = keep ? "Connection: keep-alive" : "Connection: close";
+        if (!is_authorized(req, path, token)) {
+            char resp[160];
+            snprintf(resp, sizeof resp,
+                     "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n%s\r\n\r\nUnauthorized.\n",
+                     conn_hdr);
+            write_all(client_fd, resp, strlen(resp));
+            if (!keep) return;
+            req_count++;
+            if (req_count >= MAX_KEEPALIVE_REQUESTS) return;
+            continue;
+        }
+
+        pthread_mutex_lock(&state->lock);
+        int ready = state->has_stats;
+        struct Stats snapshot = state->stats;
+        pthread_mutex_unlock(&state->lock);
+
+        if (!ready) {
+            char resp[192];
+            snprintf(resp, sizeof resp,
+                     "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n%s\r\n\r\nWaiting for first sample...\n",
+                     conn_hdr);
+            write_all(client_fd, resp, strlen(resp));
+            if (!keep) return;
+            req_count++;
+            if (req_count >= MAX_KEEPALIVE_REQUESTS) return;
+            continue;
+        }
+
+        if (is_metrics_path(path)) {
+            size_t body_size = 65536;
+            char *body = malloc(body_size);
+            if (!body) {
+                char resp[176];
+                snprintf(resp, sizeof resp,
+                         "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n%s\r\n\r\nOut of memory.\n",
+                         conn_hdr);
+                write_all(client_fd, resp, strlen(resp));
+                if (!keep) return;
+                req_count++;
+                if (req_count >= MAX_KEEPALIVE_REQUESTS) return;
+                continue;
+            }
+            render_json(&snapshot, body, body_size);
+            char header[160];
+            snprintf(header, sizeof header,
+                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%s\r\n\r\n",
+                     strlen(body), conn_hdr);
+            write_all(client_fd, header, strlen(header));
+            write_all(client_fd, body, strlen(body));
+            free(body);
+        } else {
+            size_t body_size = 131072;
+            char *body = malloc(body_size);
+            if (!body) {
+                char resp[176];
+                snprintf(resp, sizeof resp,
+                         "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n%s\r\n\r\nOut of memory.\n",
+                         conn_hdr);
+                write_all(client_fd, resp, strlen(resp));
+                if (!keep) return;
+                req_count++;
+                if (req_count >= MAX_KEEPALIVE_REQUESTS) return;
+                continue;
+            }
+            render_html(&snapshot, refresh, body, body_size, token);
+            char header[192];
+            snprintf(header, sizeof header,
+                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\n%s\r\n\r\n",
+                     strlen(body), conn_hdr);
+            write_all(client_fd, header, strlen(header));
+            write_all(client_fd, body, strlen(body));
+            free(body);
+        }
+
+        if (!keep) return;
+        req_count++;
+        if (req_count >= MAX_KEEPALIVE_REQUESTS) return;
     }
 }
 
@@ -1293,12 +1373,16 @@ static int run_http_server(const char *host, int port, double refresh, int worke
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
+    int is_loopback = 0;
     if (strcmp(host, "0.0.0.0") == 0) {
         addr.sin_addr.s_addr = INADDR_ANY;
     } else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
         fprintf(stderr, "Invalid host: %s\n", host);
         close(server_fd);
         return 1;
+    } else {
+        uint32_t host_addr = ntohl(addr.sin_addr.s_addr);
+        is_loopback = (host_addr & 0xFF000000u) == 0x7F000000u;
     }
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
@@ -1328,6 +1412,7 @@ static int run_http_server(const char *host, int port, double refresh, int worke
 
     if (workers < 1) workers = 1;
     if (workers > 8) workers = 8;
+    int allow_keepalive = (workers == 1 && is_loopback);
     pthread_t *worker_threads = calloc((size_t)workers, sizeof(*worker_threads));
     struct WorkerArgs *worker_args = calloc((size_t)workers, sizeof(*worker_args));
     if (!worker_threads || !worker_args) {
@@ -1347,6 +1432,7 @@ static int run_http_server(const char *host, int port, double refresh, int worke
         worker_args[i].state = &state;
         worker_args[i].refresh = refresh;
         worker_args[i].token = token;
+        worker_args[i].allow_keepalive = allow_keepalive;
         if (pthread_create(&worker_threads[i], NULL, worker_thread, &worker_args[i]) != 0) {
             fprintf(stderr, "Failed to start worker %d.\n", i);
             g_stop = 1;
@@ -1369,7 +1455,7 @@ static int run_http_server(const char *host, int port, double refresh, int worke
         if (client_fd < 0) continue;
         set_client_timeouts(client_fd);
         if (queue_push(&queue, client_fd) != 0) {
-            const char *resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\nServer busy.\n";
+            const char *resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nServer busy.\n";
             write_all(client_fd, resp, strlen(resp));
             close(client_fd);
         }
