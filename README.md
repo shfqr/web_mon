@@ -28,7 +28,8 @@ Auth notes:
 Use Caddy as the only public entrypoint so WebMon stays loopback-only and low-load.
 - Terminate TLS and handle public access control at the proxy.
 - Keep WebMon on `127.0.0.1` and run it with `-w 1` so Caddy can reuse a single upstream connection.
-- Use `config/Caddyfile.example` as a starting point; it strips `/webmon` and limits upstream connections.
+- Use `config/Caddyfile.example` as a starting point; it strips `/webmon`, enforces a token at the edge, and limits upstream connections.
+- When using the token gate, open `https://<host>/webmon/?token=<token>` so the UI can pass it to `/metrics`.
 
 Displayed fields (auto-updated in-page with inline bars, no full refresh):
 - Uptime and connected user count.

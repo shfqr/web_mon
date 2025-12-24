@@ -1,24 +1,46 @@
 host1.example.com {
-        @webmon_path {
-                path /webmon /webmon/*
+    # Token gate at the edge. Replace with a strong secret.
+    @webmon_path {
+        path /webmon /webmon/*
+    }
+    @webmon_token_header {
+        path /webmon /webmon/*
+        header X-WebMon-Token REPLACE_WITH_TOKEN
+    }
+    @webmon_token_query {
+        path /webmon /webmon/*
+        query token REPLACE_WITH_TOKEN
+    }
+    handle @webmon_token_header {
+        uri strip_prefix /webmon
+        reverse_proxy 127.0.0.1:61080 {
+            transport http {
+                versions 1.1
+                max_conns_per_host 1
+            }
         }
-        handle @webmon_path {
-                uri strip_prefix /webmon
-                reverse_proxy 127.0.0.1:61080 {
-                        transport http {
-                                versions 1.1
-                                max_conns_per_host 1
-                        }
-                }
+    }
+    handle @webmon_token_query {
+        uri strip_prefix /webmon
+        uri query -token
+        reverse_proxy 127.0.0.1:61080 {
+            transport http {
+                versions 1.1
+                max_conns_per_host 1
+            }
         }
+    }
+    handle @webmon_path {
+        respond "Unauthorized" 401
+    }
 
-        # Drop / reject all other requests
-        @other_than_valid_paths not path /webmon*
-        respond @other_than_valid_paths 444
+    # Drop / reject all other requests
+    @other_than_valid_paths not path /webmon*
+    respond @other_than_valid_paths 444
 
-        # default headers for any responses that do get through
-        header {
-                -Server
-                -Via
-        }
+    # default headers for any responses that do get through
+    header {
+        -Server
+        -Via
+    }
 }
